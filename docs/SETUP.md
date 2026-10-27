@@ -2,33 +2,36 @@
 
 ## Environment
 
-Tested with Python 3.12, torch 2.8 (cu128), transformers 4.56.1,
-tensorrt-cu12 10.16, onnx 1.22 on H100, with the CUDA 12.9 toolkit:
+Tested with Python 3.12, torch 2.8 (cu128), triton 3.4, transformers
+4.56.1, tensorrt-cu12 10.16, onnx 1.22 on H100, with the CUDA 12.9
+toolkit. TensorRT and onnx are only used by `--encoder trt` /
+`--decoder cuda|trt`; the default build and runtime never import them.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e .        # pip install -e ".[trt]" for the TensorRT back-ends
 cp configs/env.example.sh configs/env.local.sh   # optional: site overrides
 source configs/env.local.sh                      # or env.example.sh
 ```
 
 `configs/env.example.sh` sets `NVIDIA_TF32_OVERRIDE=0` (required, see
 pitfall 1), puts the pip TensorRT libraries on `LD_LIBRARY_PATH` and
-chooses the Python (`STRT_PYTHON`, default `python3` on `PATH`). The
+chooses the Python (`STRITON_PYTHON`, default `python3` on `PATH`). The
 workflow scripts in `scripts/workflows/` source `env.local.sh` if present,
 else `env.example.sh`.
 
-`--decoder cuda` (the default) compiles its kernels with nvcc on first use
-(`build/sidon_trt_dac_<hash>.so`, keyed by source + flags; the visible
-GPU's arch unless `STRT_CUDA_ARCHS` is set, e.g. `90`). nvcc must be on
-`PATH` or under `CUDA_HOME`; no ninja needed. `--decoder trt` needs no
-CUDA toolkit.
+`--decoder triton-cuda` and `--decoder cuda` compile the CUDA-tail
+kernels with nvcc on first use
+(`build/sidon_triton_dac_<hash>.so`, keyed by source + flags; the visible
+GPU's arch unless `STRITON_CUDA_ARCHS` is set, e.g. `90`). nvcc must be on
+`PATH` or under `CUDA_HOME`; no ninja needed. The default (Triton) and
+`--decoder trt` need no CUDA toolkit.
 
 ## Weights
 
 `tools/convert_torchscript.py --output bundle/` downloads the released
 TorchScript files (`sarulab-speech/sidon-v0.1`, pinned revision, see
-`sidon_trt/hub.py`) — or reads them from `--torchscript-dir` — and writes
+`sidon_triton/hub.py`) — or reads them from `--torchscript-dir` — and writes
 `encoder.safetensors`, `decoder.safetensors` and their configs after a
 parity check against the TorchScript (asserts > 80 dB). Every tool that
 runs the official model as a reference takes the same optional
@@ -37,21 +40,27 @@ runs the official model as a reference takes the same optional
 ## Engines
 
 `scripts/build_engines.py --bundle bundle/ --engine-dir E --onnx-dir /tmp/x`
-(GPU required) builds `encoder.plan`, `decoder.plan` and, for the default
-`--decoder cuda`, `decoder_tail.pt` (packed CUDA-tail weights). The longest
+(GPU required) writes, by default, `encoder_triton.pt` (re-laid-out
+encoder weights), `decoder_head.pt` and `decoder_tail_triton.pt`
+(Triton head / tail weights) — no ONNX, no engines. `--decoder
+triton-cuda` writes `decoder_tail.pt` (packed CUDA-tail weights) instead
+of `decoder_tail_triton.pt`.
+`--encoder trt` builds `encoder.plan` instead of `encoder_triton.pt`,
+`--decoder cuda` builds the head as `decoder.plan`. The longest
 chunk is the demo's 96 s (`--max-seconds`). `build_report.json` holds
 accuracy vs the fp32 torch reference and the padding-invariance check.
 `--decoder trt` builds the whole decoder in TensorRT (no custom kernels;
 strongly typed fp16 with fp32 islands from `--decoder-fp32`, default
 `final` — the last conv + tanh in fp16 was the whole accuracy gap);
-`--encoder-precision` fp16 (default) / bf16 / fp32. Engines are specific
-to the GPU architecture and TensorRT version they were built with.
+`--encoder-precision` (with `--encoder trt`) fp16 (default) / bf16 /
+fp32. Engines are specific to the GPU architecture and TensorRT version
+they were built with.
 
 ## Workflows
 
 `scripts/workflows/*.sh` chain the tools; paths come from arguments and
-`STRT_*` variables (`STRT_BUNDLE`, `STRT_ENGINE_DIR`, `STRT_WORK`,
-`STRT_TORCHSCRIPT`, `STRT_DECODER`, ...; defaults in `common.sh`):
+`STRITON_*` variables (`STRITON_BUNDLE`, `STRITON_ENGINE_DIR`, `STRITON_WORK`,
+`STRITON_TORCHSCRIPT`, `STRITON_DECODER`, ...; defaults in `common.sh`):
 
 | script | |
 |---|---|
@@ -90,7 +99,7 @@ job.
    that is why the fused residual units are CUDA torch ops, not plugins.
    Also: no `from __future__ import annotations` in plugin modules, and
    int plugin attributes break on numpy 2.x (`int(f.data)`).
-8. CUDA graphs share one memory pool (`TRTPipeline._pool`); the tail
+8. CUDA graphs share one memory pool (`SidonPipeline._pool`); the tail
    allocates inside the graphs, so memory grows with the number of
    distinct length buckets seen (~13 GB with all of them).
 9. torchaudio's decode/encode hold the GIL: `FileStreamer` uses spawned

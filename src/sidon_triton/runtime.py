@@ -1,7 +1,8 @@
-"""TensorRT runtime: torch fp32 fbank -> encoder engine -> decoder head
-engine -> fused CUDA decoder tail.
+"""Runtime: torch fp32 fbank -> encoder (Triton kernels, or a TensorRT
+engine) -> decoder head (Triton GEMM kernels, or a TensorRT engine) ->
+decoder tail (Triton kernels, or the fused CUDA kernels).
 
-``TRTPipeline.restore`` reproduces the official demo's long-input
+``SidonPipeline.restore`` reproduces the official demo's long-input
 procedure exactly (sidon_demo_beta/app.py):
 
 - preprocess (peak 0.9, 50 Hz high-pass, 16 kHz), append 1.5 s of zeros;
@@ -34,7 +35,15 @@ from pathlib import Path
 
 import torch
 
-from . import cuda_tail, flexrel_triton, frontend, snake_triton
+from . import (
+    cuda_tail,
+    flexrel_triton,
+    frontend,
+    snake_triton,
+    triton_encoder,
+    triton_head,
+    triton_tail,
+)
 from .engines import TRTStage, deserialize
 from .export_onnx import head_mask_lengths, head_masks
 
@@ -67,33 +76,61 @@ class EngineSet:
     buffers re-viewed per (batch, length): TensorRT needs contiguous
     [B, L, ...] tensors at fixed addresses."""
 
-    def __init__(self, engine_dir: Path,
-                 tail: cuda_tail.CudaDecoderTail | None,
-                 front: frontend.SeamlessFbank) -> None:
+    def __init__(self, engine_dir: Path, tail,
+                 front: frontend.SeamlessFbank,
+                 head: triton_head.TritonDecoderHead | None = None,
+                 encoder: tuple | None = None) -> None:
+        """tail: CudaDecoderTail / TritonDecoderTail (None: TRT-only
+        decoder); encoder: (TritonEncoder, max_batch, max_seconds) replaces
+        the encoder engine; head: TritonDecoderHead replaces the head
+        engine (required by the Triton tail, which takes its Snake'd
+        output too)."""
+        skip = set()
+        if head is not None:
+            skip.add("decoder")
+        if encoder is not None:
+            skip.add("encoder")
         engines = {
             tag: deserialize(engine_dir / name)
-            for tag, name in ENGINE_FILES.items()
+            for tag, name in ENGINE_FILES.items() if tag not in skip
         }
-        names = {
-            engines["encoder"].get_tensor_name(i)
-            for i in range(engines["encoder"].num_io_tensors)
-        }
-        assert "lens" in names, (
-            f"{engine_dir}: engines predate bucketed execution (no `lens` "
-            "input); rebuild with scripts/build_engines.py"
-        )
+        if encoder is None:
+            names = {
+                engines["encoder"].get_tensor_name(i)
+                for i in range(engines["encoder"].num_io_tensors)
+            }
+            assert "lens" in names, (
+                f"{engine_dir}: engines predate bucketed execution (no "
+                "`lens` input); rebuild with scripts/build_engines.py"
+            )
         self.tail = tail
         self.front = front
-        decoder = engines["decoder"]
-        io = [decoder.get_tensor_name(i) for i in range(decoder.num_io_tensors)]
-        # decoder engine: CUDA-tail head (-> z) or TRT-only decoder (-> audio)
-        self.trt_decoder = "audio" in io
-        assert self.trt_decoder or tail is not None, "head engine needs tail"
-        self.mask_names = [name for name in io if name.startswith("mask_")]
-        self.from_block = len(self.mask_names) - 2
-        self.max_batch, self.max_seq, _ = _profile_max(
-            engines["encoder"], "features"
+        self.head = head
+        if head is None:
+            decoder = engines["decoder"]
+            io = [decoder.get_tensor_name(i)
+                  for i in range(decoder.num_io_tensors)]
+            # decoder engine: CUDA-tail head (-> z) or TRT-only decoder
+            self.trt_decoder = "audio" in io
+            self.mask_names = [n for n in io if n.startswith("mask_")]
+            self.from_block = len(self.mask_names) - 2
+        else:
+            self.trt_decoder = False
+            self.mask_names = []
+            self.from_block = head.from_block
+        assert self.trt_decoder or tail is not None, "head needs the tail"
+        self.triton_tail = isinstance(tail, triton_tail.TritonDecoderTail)
+        assert head is not None or not self.triton_tail, (
+            "the Triton tail needs the Triton head"
         )
+        if encoder is None:
+            self.encoder = None
+            self.max_batch, self.max_seq, _ = _profile_max(
+                engines["encoder"], "features"
+            )
+        else:
+            self.encoder, self.max_batch, max_seconds = encoder
+            self.max_seq = int(max_seconds * 50)
         device = torch.device("cuda")
         b, s = self.max_batch, self.max_seq
         self.max_samples = s * SAMPLES_PER_FRAME
@@ -108,15 +145,19 @@ class EngineSet:
         self.masks = [
             torch.zeros(b * length, device=device) for length in self.mask_max
         ]
-        self.encoder_stage = TRTStage(
-            engines["encoder"],
-            {
-                "features": self.features.view(b, s, 160),
-                "lens": self.enc_lens,
-            },
-        )
-        self.hidden = self.encoder_stage.outputs["hidden"].view(-1)
-        self.decoder_stage = TRTStage(
+        if encoder is None:
+            self.encoder_stage = TRTStage(
+                engines["encoder"],
+                {
+                    "features": self.features.view(b, s, 160),
+                    "lens": self.enc_lens,
+                },
+            )
+            self.hidden = self.encoder_stage.outputs["hidden"].view(-1)
+        else:
+            self.encoder_stage = None
+            self.hidden = torch.zeros(b * s * 1024, device=device)
+        self.decoder_stage = None if head is not None else TRTStage(
             engines["decoder"],
             {
                 "hidden": self.dec_input.view(b, s + 1, 1024),
@@ -128,7 +169,12 @@ class EngineSet:
                 },
             },
         )
-        if self.trt_decoder:
+        if head is not None:
+            self.z = None  # the Triton head allocates z (graph pool)
+            self.audio = torch.zeros(
+                b * (HOP * (s + 1) - TRIM), device=device
+            )
+        elif self.trt_decoder:
             self.z = None
             self.audio = self.decoder_stage.outputs["audio"].view(-1)
         else:
@@ -148,15 +194,17 @@ class EngineSet:
             return
         assert 1 <= batch <= self.max_batch, batch
         assert MIN_SEQ <= seq <= self.max_seq, seq
-        enc = self.encoder_stage.context
-        enc.set_input_shape("features", (batch, seq, 160))
-        enc.set_input_shape("lens", (batch,))
-        dec = self.decoder_stage.context
-        dec.set_input_shape("hidden", (batch, dec_seq, 1024))
-        for name, length in zip(
-            self.mask_names, head_mask_lengths(dec_seq, self.from_block)
-        ):
-            dec.set_input_shape(name, (batch, length))
+        if self.encoder_stage is not None:
+            enc = self.encoder_stage.context
+            enc.set_input_shape("features", (batch, seq, 160))
+            enc.set_input_shape("lens", (batch,))
+        if self.decoder_stage is not None:
+            dec = self.decoder_stage.context
+            dec.set_input_shape("hidden", (batch, dec_seq, 1024))
+            for name, length in zip(
+                self.mask_names, head_mask_lengths(dec_seq, self.from_block)
+            ):
+                dec.set_input_shape(name, (batch, length))
         self._shape = (batch, seq, dec_seq)
 
     def enqueue(self, batch: int, samples: int, cached: bool) -> None:
@@ -174,8 +222,7 @@ class EngineSet:
         )
         frames = frontend.valid_features(valid)
         self.enc_lens[:batch].copy_(frames)
-        self.encoder_stage.enqueue(stream)
-        hidden = self.hidden[: batch * seq * 1024].view(batch, seq, 1024)
+        hidden = self.run_encoder(batch, seq, stream)
         dec_input = self.dec_input[: batch * dec_seq * 1024].view(
             batch, dec_seq, 1024
         )
@@ -185,16 +232,45 @@ class EngineSet:
             dec_input.copy_(hidden)
         dec_frames = frames + int(cached)
         self.dec_lens[:batch].copy_(dec_frames)
-        self._fill_masks(batch, dec_seq, dec_frames)
-        self.decoder_stage.enqueue(stream)
-        if self.trt_decoder:  # audio written straight into self.audio
+        z = self.run_head(dec_input, dec_frames, stream)
+        if z is None:  # TRT-only decoder: audio written into self.audio
             return
+        audio = self.run_tail(z, dec_frames)  # [B, 1, HOP * dec_seq - TRIM]
+        self.audio[: audio.numel()].copy_(audio.view(-1))
+
+    def run_encoder(self, batch: int, seq: int, stream) -> torch.Tensor:
+        """features[:batch, :seq] (valid frames enc_lens) -> hidden
+        [B, L, 1024] fp32 (a view of self.hidden)."""
+        hidden = self.hidden[: batch * seq * 1024].view(batch, seq, 1024)
+        if self.encoder is None:
+            self.encoder_stage.enqueue(stream)
+        else:
+            features = self.features[: batch * seq * 160].view(
+                batch, seq, 160)
+            self.encoder(features, self.enc_lens[:batch], out=hidden)
+        return hidden
+
+    def run_head(self, dec_input: torch.Tensor, frames, stream):
+        """decoder head on dec_input [B, L, 1024] (valid `frames`) -> the
+        tail input: z [B, T, C] time-major ((z, snake1(z)) for the Triton
+        tail; None: TRT-only decoder)."""
+        if self.head is not None:
+            return self.head(dec_input, frames, with_snake=self.triton_tail)
+        batch, dec_seq, _ = dec_input.shape
+        self._fill_masks(batch, dec_seq, frames)
+        self.decoder_stage.enqueue(stream)
+        if self.trt_decoder:
+            return None
         length = cuda_tail.head_samples(dec_seq)
-        z = self.z[: batch * length * cuda_tail.TAIL_CHANNELS].view(
+        return self.z[: batch * length * cuda_tail.TAIL_CHANNELS].view(
             batch, length, cuda_tail.TAIL_CHANNELS
         )
-        audio = self.tail(z, dec_frames)  # [B, 1, HOP * dec_seq - TRIM]
-        self.audio[: audio.numel()].copy_(audio.view(-1))
+
+    def run_tail(self, z, frames) -> torch.Tensor:
+        """run_head output -> audio [B, 1, HOP * L - TRIM]."""
+        if self.triton_tail:
+            return self.tail(*z, frames)
+        return self.tail(z, frames)
 
     def _fill_masks(self, batch: int, dec_seq: int, frames) -> None:
         lengths = head_mask_lengths(dec_seq, self.from_block)
@@ -220,29 +296,27 @@ class EngineSet:
         self.set_shapes(batch, seq, seq)
         self.features[: features.numel()].view_as(features).copy_(features)
         self.enc_lens[:batch].fill_(seq)
-        self.encoder_stage.enqueue(torch.cuda.current_stream())
-        return self.hidden[: batch * seq * 1024].view(batch, seq, 1024).clone()
+        return self.run_encoder(
+            batch, seq, torch.cuda.current_stream()
+        ).clone()
 
     @torch.no_grad()
     def decode(self, hidden: torch.Tensor) -> torch.Tensor:
         """exact-length hidden [B, L, 1024] -> audio [B, 960 L - 26]."""
         batch, seq, _ = hidden.shape
         self.set_shapes(batch, seq, seq)
-        self.dec_input[: hidden.numel()].view_as(hidden).copy_(hidden)
+        dec_input = self.dec_input[: hidden.numel()].view_as(hidden)
+        dec_input.copy_(hidden)
         self.dec_lens[:batch].fill_(seq)
-        self._fill_masks(batch, seq, self.dec_lens[:batch])
-        self.decoder_stage.enqueue(torch.cuda.current_stream())
-        if self.trt_decoder:
+        z = self.run_head(dec_input, self.dec_lens[:batch],
+                          torch.cuda.current_stream())
+        if z is None:
             audio = self.audio[: batch * (HOP * seq - TRIM)]
             return audio.view(batch, -1).clone()
-        length = cuda_tail.head_samples(seq)
-        z = self.z[: batch * length * cuda_tail.TAIL_CHANNELS].view(
-            batch, length, cuda_tail.TAIL_CHANNELS
-        )
-        return self.tail(z).view(batch, -1).clone()
+        return self.run_tail(z, None).view(batch, -1).clone()
 
 
-class TRTPipeline:
+class SidonPipeline:
     def __init__(
         self,
         engine_dir: Path,
@@ -254,15 +328,33 @@ class TRTPipeline:
             "under the same setting (it also keeps the fbank GEMM fp32)"
         )
         engine_dir = Path(engine_dir)
-        flexrel_triton.register_trt_plugin_qr_dyn()
-        snake_triton.register_trt_plugin()
-        # CUDA-tail engines carry decoder_tail.pt; TRT-only decoders do not
+        enc_path = engine_dir / triton_encoder.ENCODER_FILE
+        head_path = engine_dir / triton_head.HEAD_FILE
+        self.trt_free = enc_path.exists() and head_path.exists()
+        if not self.trt_free:  # TensorRT is only imported when needed
+            flexrel_triton.register_trt_plugin_qr_dyn()
+            snake_triton.register_trt_plugin()
+        # decoder tail: Triton (decoder_tail_triton.pt) or CUDA
+        # (decoder_tail.pt); TRT-only decoders have neither. A Triton head
+        # (decoder_head.pt) replaces the head engine.
         tail_path = engine_dir / cuda_tail.TAIL_FILE
-        self.tail = (
-            cuda_tail.load_tail(tail_path) if tail_path.exists() else None
+        ttail_path = engine_dir / triton_tail.TAIL_FILE
+        if ttail_path.exists():
+            self.tail = triton_tail.load_tail(ttail_path)
+        elif tail_path.exists():
+            self.tail = cuda_tail.load_tail(tail_path)
+        else:
+            self.tail = None
+        self.head = (
+            triton_head.load_head(head_path) if head_path.exists() else None
+        )
+        self.encoder = (
+            triton_encoder.load_encoder(enc_path) if enc_path.exists()
+            else None
         )
         self.front = frontend.SeamlessFbank().cuda().eval()
-        self.long = EngineSet(engine_dir, self.tail, self.front)
+        self.long = EngineSet(engine_dir, self.tail, self.front, self.head,
+                              self.encoder)
         self.use_graph = use_graph
         self.max_graphs = max_graphs
         self.compute = torch.cuda.Stream()
@@ -385,7 +477,7 @@ class TRTPipeline:
         gpu_preprocess runs normalize / high-pass / resample on the GPU
         (frontend.preprocess_gpu); False uses the demo's CPU torchaudio path.
         per_channel restores every channel on its own (e.g. 2-channel
-        telephone dialogue, one speaker per channel) -> [channels, samples];
+        dialogue, one speaker per channel) -> [channels, samples];
         otherwise channels are downmixed as in the official demo.
         """
         waveform = torch.as_tensor(waveform)

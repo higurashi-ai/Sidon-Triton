@@ -6,5 +6,5 @@ unset NVIDIA_TF32_OVERRIDE  # the official path as users run it
 WAV_ARGS=()
 if [ $# -gt 0 ]; then WAV_ARGS=(--wav "$1"); fi
 PY scripts/bench_baseline.py "${TS_ARGS[@]}" "${WAV_ARGS[@]}" \
-  --output "${2:-${STRT_WORK}/baseline.json}"
+  --output "${2:-${STRITON_WORK}/baseline.json}"
 echo "BENCH_BASELINE_OK"

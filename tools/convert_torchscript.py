@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the released Sidon v0.1 TorchScript modules into a Sidon-TRT bundle.
+"""Convert the released Sidon v0.1 TorchScript modules into a Sidon-Triton bundle.
 
     convert_torchscript.py --torchscript-dir sidon-v0.1/ --output bundle/
 
@@ -27,10 +27,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt import frontend  # noqa: E402
-from sidon_trt.audio_io import read_wav  # noqa: E402
-from sidon_trt.modeling import (  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton import frontend  # noqa: E402
+from sidon_triton.audio_io import read_wav  # noqa: E402
+from sidon_triton.modeling import (  # noqa: E402
     DECODER_CONFIG,
     DECODER_WEIGHTS,
     ENCODER_CONFIG,

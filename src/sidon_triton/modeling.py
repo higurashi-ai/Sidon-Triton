@@ -73,7 +73,7 @@ class FlexRelSelfAttention(nn.Module):
             from torch.nn.attention.flex_attention import flex_attention
 
             if (
-                os.environ.get("STRT_FLEX_NO_COMPILE") == "1"
+                os.environ.get("STRITON_FLEX_NO_COMPILE") == "1"
                 or not torch.cuda.is_available()
             ):
                 cls._flex_attention = flex_attention
@@ -253,7 +253,7 @@ def build_decoder(config: dict) -> DACDecoder:
 # ---- bundle -------------------------------------------------------------------
 
 
-class SidonTRT:
+class SidonBundle:
     """encoder (HF eager attention) + decoder, fp32, loaded from a bundle."""
 
     def __init__(self, bundle_dir: Path, device: str = "cuda") -> None:
@@ -283,5 +283,5 @@ class SidonTRT:
         return replace_attention_with_flex(self.encoder.model)
 
 
-def load_bundle(bundle_dir, device: str = "cuda") -> SidonTRT:
-    return SidonTRT(Path(bundle_dir), device=device)
+def load_bundle(bundle_dir, device: str = "cuda") -> SidonBundle:
+    return SidonBundle(Path(bundle_dir), device=device)

@@ -1,109 +1,87 @@
-# Sidon-TRT
+# Sidon-Triton
 
-Sidon-TRT is a fast inference implementation of
+Sidon-Triton is a fast inference implementation of
 [Sidon v0.1](https://huggingface.co/sarulab-speech/sidon-v0.1) speech
 restoration (any-rate noisy speech in, 48 kHz restored speech out),
 implemented by Rikuto Kotoge. It is built by **converting the released
 weights — no retraining** — and matches the official demo's output to
-within ~0.1 dB log-mel.
+within ~0.03 dB log-mel.
 
-Two decoder back-ends, selected at engine build time:
+Everything runs on Triton kernels + cuBLAS (encoder, decoder head and
+48 kHz decoder tail): only torch + Triton are needed — no TensorRT, no
+CUDA toolkit. Optional TensorRT / hand-written CUDA back-ends are kept for
+comparison (see [Other back-ends](#other-back-ends)).
 
-- `--decoder cuda` (default): DAC decoder head in TensorRT + fused CUDA
-  kernels for the 48 kHz tail. Fastest and closest to the official output;
-  needs Hopper / datacenter-Blackwell shared memory.
-- `--decoder trt`: the whole decoder in TensorRT (strongly typed fp16
-  with an fp32 output layer, Snake as a Triton plugin), no custom CUDA
-  kernels. Same accuracy, ~1.7x slower; fallback for other GPUs or if the
-  kernels are not wanted.
-
-## Official Sidon vs Sidon-TRT (H100 SXM, batch 1)
+## Official Sidon vs Sidon-Triton (H100 SXM, batch 1)
 
 Official = the released TorchScript (fp32) with the demo's CPU fbank, run
 as the demo runs it — no per-stage synchronization, so the CPU fbank of
 the next chunk overlaps the GPU work of the previous one
 (`scripts/bench_baseline.py`; with a sync after every stage, for the
-breakdown, it takes 3462 ms). Sidon-TRT = `scripts/bench_e2e.py`, one CUDA
-graph per chunk (front-end + encoder + decoder).
+breakdown, it takes 3462 ms). Sidon-Triton = `scripts/bench_e2e.py`, one
+CUDA graph per chunk (front-end + encoder + decoder).
 
-| | official | Sidon-TRT `--decoder trt` | Sidon-TRT `--decoder cuda` |
-|---|---|---|---|
-| 600 s input, end to end | 2677 ms | 404 ms (6.6x) | **236 ms (11.3x)** |
-| 128 clips 1.5-25 s (29 min) | — | 1599 ms | **1065 ms** |
-| device memory after init | — | 4.7 GB | 3.0 GB |
-| log-mel L1 vs official (5 noisy mixtures) | 0 | 0.08-0.13 dB | **0.08-0.13 dB** |
-| custom CUDA kernels / GPU limit | no | no / any TRT GPU | yes / H100, B200 class |
+| | official | Sidon-Triton |
+|---|---|---|
+| 600 s input, end to end | 2677 ms | **202 ms (13.3x)** |
+| 128 clips 1.5-25 s (29 min) | 5333 ms | **828 ms (6.4x)** |
+| device memory after init | 1.7 GB | 1.3 GB |
+| device memory after the 128 clips | 16.2 GB | 6.6 GB |
+| log-mel L1 vs official (5 noisy mixtures) | 0 | **0.02-0.03 dB** |
 
 Per chunk length (milliseconds; official: GPU stages + CPU fbank of that
-chunk, serial):
+chunk, serial; Sidon-Triton encoder times are CUDA-graph replays):
 
-| chunk | official enc / dec / CPU fbank | **official total** | trt: enc / dec | **trt total** | cuda: enc / head / tail | **cuda total** | cuda RTF |
-|---|---|---|---|---|---|---|---|
-| 15 s | 13.8 / 17.8 / 23.7 | **55** | 2.5 / 9.2 | **11.3** | 2.5 / 2.3 / 2.9 | **7.2** | 4.8e-4 |
-| 30 s | 33.8 / 32.7 / 45.2 | **112** | 3.5 / 17.3 | **20.4** | 3.5 / 3.9 / 5.3 | **12.3** | 4.1e-4 |
-| 60 s | 102.7 / 63.9 / 91.1 | **258** | 5.5 / 33.6 | **38.9** | 5.5 / 7.4 / 10.3 | **22.7** | 3.8e-4 |
-| 96 s | 234.3 / 109.9 / 144.3 | **489** | 9.3 / 53.6 | **62.7** | 9.2 / 11.4 / 15.8 | **36.4** | 3.8e-4 |
+| chunk | official enc / dec / CPU fbank | **official total** | Sidon-Triton enc / dec head / dec tail | **Sidon-Triton total** | RTF |
+|---|---|---|---|---|---|
+| 15 s | 13.8 / 17.8 / 23.7 | **55** | 1.3 / 1.5 / 2.7 | **5.5** | 3.6e-4 |
+| 30 s | 33.8 / 32.7 / 45.2 | **112** | 2.2 / 2.6 / 5.1 | **9.8** | 3.3e-4 |
+| 60 s | 102.7 / 63.9 / 91.1 | **258** | 4.4 / 5.0 / 9.9 | **19.2** | 3.2e-4 |
+| 96 s | 234.3 / 109.9 / 144.3 | **489** | 7.6 / 7.7 / 16.0 | **31.1** | 3.2e-4 |
 
-(The front-end — fbank on GPU — is 0.33 ms in every Sidon-TRT row.
-Official preprocessing of a 600 s file adds 410 ms CPU; Sidon-TRT's GPU
+(The front-end — fbank on GPU — is 0.33 ms per chunk. Official
+preprocessing of a 600 s file adds 410 ms CPU; Sidon-Triton's GPU
 preprocessing takes 3 ms.)
 
 File throughput with `scripts/run.py` (decode / encode in worker
-processes, `--decoder cuda`): ~1040x realtime disk to disk over 5323
-speech files (FLAC, 8.6 h in total), GPU busy 98%.
+processes): ~1040x realtime disk to disk over a few thousand speech files
+(FLAC, ~9 h in total), GPU busy 98% — measured with an earlier, ~15% slower
+TensorRT build.
 
 **Why batch 1.** From 15 s up, a single chunk already gives every kernel
 far more parallel work than the GPU has SMs (the 48 kHz decoder stages
 alone are millions of rows) and CUDA graphs remove the launch overhead,
 so there is nothing left for batching to fill: the cost per audio second
-is flat from 30 s to 96 s chunks (RTF 4.1e-4 → 3.8e-4 above). Batching
+is flat from 30 s to 96 s chunks (RTF 3.3e-4 → 3.2e-4 above). Batching
 mixed lengths also pads every item to the longest one. Measured with a
-batched engine set: no gain on mixed 1.5-25 s clips or long files, ~1.3x
-only on uniformly short clips (~5.8 s average), for +14 GB of memory —
-so it was removed.
+batched set: no gain on mixed 1.5-25 s clips or long files, ~1.3x only on
+uniformly short clips (~5.8 s average), for +14 GB of memory — so it was
+removed.
 
-**Chunks longer than 96 s.** The engines accept longer chunks
+**Chunks longer than 96 s.** Longer chunks are accepted
 (`build_engines.py --max-seconds`, `run.py --chunk-seconds`), but this is
 not validated in the current version and gains little: with the cost per
-second already flat, a longer chunk only removes a few chunk boundaries
-(an earlier 120 s build ran at RTF 3.7e-4 vs 3.8e-4 at 96 s), while
-moving the output further from the official 96 s chunking.
+second already flat, a longer chunk only removes a few chunk boundaries,
+while moving the output further from the official 96 s chunking.
 
 ## Accuracy
 
 - Conversion is exact: encoder 126 dB, decoder bit-identical vs the
   released TorchScript (fp32), `tools/convert_torchscript.py`.
-- Engines vs the fp32 torch reference: encoder hidden ~52-53 dB (fp16 with
-  an fp32 feature-projection island); audio waveform SNR 26-27 dB for both
-  decoders (fp16 phase noise; the log-mel distance is the meaningful
-  number).
-- `--decoder cuda` vs the official demo output (log-mel L1 on speech
-  frames): **mean 0.11 / p95 0.17 / max 0.42 dB** over 200 random
-  speech clips; 0.08-0.09 dB on 7-15 min 2-channel telephone
-  recordings (`--per-channel`).
-- `--decoder trt` precision (`--decoder-fp32`, log-mel L1 vs official on
-  the 5 mixtures / 96 s chunk time):
-
-  | TRT decoder | log-mel L1 | 96 s chunk |
-  |---|---|---|
-  | weakly typed fp16 (`weak`) | 0.27-0.32 dB | 61.9 ms |
-  | strongly typed, all fp16 (`none`) | 0.19-0.23 dB | 60.6 ms |
-  | + fp32 final Snake/conv/tanh (`final`, **default**) | **0.08-0.13 dB** | 62.7 ms |
-  | + fp32 residual stream (`final,residual`) | 0.08-0.13 dB | 75.6 ms |
-  | + fp32 block 4, 48 kHz (`final,block4`) | 0.08-0.13 dB | 80.5 ms |
-
-  The deviation came almost entirely from the last 48-channel conv
-  (48x7 taps summed into one sample) and tanh in fp16; the CUDA tail
-  already computes them in fp32. bf16 would not help: fewer mantissa
-  bits than fp16, and TensorRT has no fast bf16 tactics for this decoder.
+- vs the fp32 torch reference: encoder hidden 66.6-67.1 dB (fp16 GEMM
+  operands, fp32 residual stream / norms / softmax, fp32 feature
+  projection), decoder head 61 dB, tail 50 dB; audio waveform SNR 43 dB
+  (fp16 phase noise; the log-mel distance is the meaningful number).
+- vs the official demo output (log-mel L1 on speech frames):
+  **mean 0.026 / p95 0.042 / max 0.072 dB** over 200 random speech clips;
+  0.02 dB on long 2-channel dialogue recordings (`--per-channel`).
 - For scale: re-chunking the official model itself (20 s instead of 96 s
   windows) moves its output by 1.4-3.2 dB.
-- Large-scale run (5323 clips + long 2-channel recordings): no non-finite,
+- Large-scale run (thousands of clips + long 2-channel recordings): no non-finite,
   clipped or wrong-length outputs; bit-identical across repeated runs.
 - Listening: `tools/make_listening_set.py` writes named and blind A/B pairs
-  (official vs Sidon-TRT, also as stereo L=official / R=Sidon-TRT);
-  `tools/make_listening_variants.py` adds fp32 / bf16 variants. fp16 was
-  chosen after listening.
+  (official vs Sidon-Triton, also as stereo L=official / R=Sidon-Triton);
+  `tools/make_listening_variants.py` adds fp32 / bf16 variants.
 
 ## How
 
@@ -112,115 +90,116 @@ wav (any rate/channels)
  └ GPU preprocess: peak 0.9, 50 Hz high-pass (fp64 FFT conv), 16 kHz resample
  └ demo chunking: +1.5 s tail, 96 s chunks, 1-frame feature carry-over
    └ fp32 SeamlessM4T fbank (torch)                         ┐
-   └ encoder — TensorRT fp16: w2v-BERT 8 layers, LoRA       │ one CUDA graph
-       merged, fp32 feature projection, fused Triton        │ per length bucket
-       relative_key attention plugin with key-length mask   │ (1 s steps <= 32 s,
-   └ decoder (--decoder cuda):                              │  4 s above)
-       head — TensorRT fp16: input conv, blocks 0-1,        │
-         block 2 upsample (time-major out)                  │
-       tail — fused CUDA kernels (csrc/dac_kernels.cu):     │
-         each residual unit of blocks 2-4 is one kernel     │
-         (Snake -> dilated conv -> Snake -> 1x1 -> residual,│
-         mma.sync, weights resident or streamed), Snake +   │
-         ConvTranspose upsamples, Snake + conv + tanh       │
-     decoder (--decoder trt): all of it in TensorRT fp16    ┘
+   └ encoder — Triton + cuBLAS: w2v-BERT 8 layers, LoRA     │ one CUDA graph
+       merged; fp16 GEMMs accumulating into an fp32         │ per length bucket
+       residual stream, fused norm / GLU / causal dwconv,   │ (1 s steps <= 32 s,
+       flash attention with in-kernel relative_key bias and │
+       key-length mask                                      │
+   └ decoder:                                               │  4 s above)
+       head — Triton GEMM kernels, time-major: input conv,  │
+         blocks 0-1, block 2 upsample; each epilogue adds   │
+         bias (+ residual) and writes the Snake of its      │
+         output for the next conv                           │
+       tail — Triton: each residual unit of blocks 2-4 is   │
+         one kernel (dilated conv as one GEMM over a        │
+         (tap, channel) K axis -> Snake -> 1x1 -> residual; │
+         writes the next Snake'd input too), one kernel per │
+         upsample, the final conv reduced in the last       │
+         unit's epilogue (fp32) + tanh                      ┘
 ```
 
 - **Exact bucketing**: a chunk zero-padded to its bucket gives the
   exact-length output — fbank statistics over valid frames only, attention
   keys past the valid length masked, every decoder conv re-zeroed past it
-  (validity masks are engine inputs). Any mix of input lengths reuses
+  (valid lengths are kernel inputs). Any mix of input lengths reuses
   ~30-50 captured graphs.
-- **File throughput**: `sidon_trt.stream.FileStreamer` decodes and encodes
+- **File throughput**: `sidon_triton.stream.FileStreamer` decodes and encodes
   in spawned worker processes overlapped with the GPU.
 
 ## GPU support
 
-Built and measured on H100 only; engines are architecture-specific (build
-them on the deployment GPU). The CUDA tail kernels need up to ~210 KB
-shared memory per block (Hopper / datacenter Blackwell); on A100 (164 KB)
-or Ada such as RTX 4090 (~99 KB) build with `--decoder trt`. The kernels
-are compiled by nvcc on first use for the visible GPU.
+Built and measured on H100 only. The Triton kernels JIT-compile on first
+use; their tile sizes were tuned on H100 and the largest (C = 192 tail
+units: 128 x 256 tiles, 3 stages) assume Hopper-class shared memory, so
+other GPUs may need smaller tiles (`UNIT_CONFIG` / `UP_CONFIG` in
+`triton_tail.py`, `conv_config` in `triton_head.py`).
 
 ## Quick start
 
 ```bash
-git clone <this repo> Sidon-TRT && cd Sidon-TRT
+git clone <this repo> Sidon-Triton && cd Sidon-Triton
 python -m venv .venv && source .venv/bin/activate && pip install -e .
-source configs/env.example.sh       # NVIDIA_TF32_OVERRIDE=0 (required), TensorRT libs
-# nvcc on PATH (only for the default --decoder cuda)
+source configs/env.example.sh       # NVIDIA_TF32_OVERRIDE=0 (required)
 python tools/convert_torchscript.py --output bundle/   # downloads sidon-v0.1 from the Hub
 python scripts/build_engines.py --bundle bundle/ --engine-dir engines/ \
-    --onnx-dir /tmp/sidon-trt-onnx [--decoder trt]
+    --onnx-dir /tmp/sidon-triton-onnx  # packs the kernel weights + validates
 python scripts/run.py --engine-dir engines/ --input-dir corpus/ \
     --output-dir restored/ --format flac [--per-channel]
 ```
 
 Or in one go, with a parity check against the official model on your own
 inputs: `scripts/workflows/build_and_bench.sh eval1.wav eval2.wav`.
-See `docs/SETUP.md` for the environment, the other workflows and pitfalls.
+See `docs/SETUP.md` for the environment, the other workflows and pitfalls,
+and `docs/DESIGN.md` for what was measured and dropped.
 
-The runtime detects the decoder type from the engine directory.
+The runtime detects the back-end from the files in the engine directory.
 
 ```python
-from sidon_trt.runtime import TRTPipeline
-pipeline = TRTPipeline("engines/")
+from sidon_triton.runtime import SidonPipeline
+pipeline = SidonPipeline("engines/")
 audio48k = pipeline.restore(waveform, sample_rate)              # demo chunking
 stereo = pipeline.restore(two_channel, sr, per_channel=True)    # 1 speaker / channel
 sliding = pipeline.restore_sliding(waveform, sr, window_seconds=20)
 
-from sidon_trt.stream import FileStreamer                       # many files
+from sidon_triton.stream import FileStreamer                       # many files
 with FileStreamer(pipeline, readers=8, writers=8) as streamer:  # spawned workers:
     stats = streamer.run(paths, "restored/", fmt="flac")        # use a __main__ guard
 ```
 
-`--per-channel` restores each channel separately (2-channel telephone
-dialogue, channel layout kept); the default downmixes like the official
-demo. See `docs/SETUP.md` for setup details and pitfalls.
+`--per-channel` restores each channel separately (2-channel dialogue,
+one speaker per channel, channel layout kept); the default downmixes like
+the official demo. See `docs/SETUP.md` for setup details and pitfalls.
 
-## Design notes (measured and dropped)
+## Other back-ends
 
-| tried | outcome |
-|---|---|
-| TensorRT decoder with Snake exported as ops | TRT does not fuse Snake: 57% of decoder time |
-| `sidon::Snake` Triton TRT plugin | kept for the TensorRT decoder parts (`--decoder trt`) |
-| fused residual unit as Triton TRT AOT plugin | slower than TRT convs (pow2 padding, 48 KiB AOT smem cap); removed |
-| CUDA residual units, WMMA, channel-major | 8-10 ms/unit; replaced by time-major + mma.sync (1-2 ms/unit) |
-| bf16 encoder | 0.4-1.1 dB off official; fp16 + fp32 projection: 0.1 dB |
-| fp16 feature projection | up to 14 dB off on short clips (silent frames: LayerNorm variance ~0) |
-| bf16 CUDA tail | 18 dB less accurate than fp16 at the same speed |
-| TensorRT bf16 decoder | as slow as fp32 (no fast bf16 conv tactics); strongly typed fails in Myelin |
-| more fp32 in the TRT decoder (block 4, residual stream) | no accuracy gain over the fp32 output layer, +20-30% time |
-| all-fp32 engines | 0.01-0.03 dB off official, 6.3x slower than fp16 |
-| in-graph length masks in TensorRT | TRT 10.16 fp16 produced all-zero output -> masks are inputs |
-| batching short clips | ~1.3x on real short clips, none on mixed lengths, +14 GB; removed |
-| 20 s sliding windows (training length) | 16% slower; differs from 96 s chunking by 1.4-3.2 dB (window effect) |
-| wgmma/TMA tail kernels | not done: est. ~2x on the tail, ~1.2x overall |
+Kept for comparison, selected at build time (`pip install -e ".[trt]"`
+for TensorRT; nvcc for the CUDA tail). H100, batch 1:
+
+| build flags | encoder / decoder head / tail | 600 s | log-mel L1 (200 clips mean / max) |
+|---|---|---|---|
+| default | Triton / Triton / Triton | **202 ms** | **0.026 / 0.072 dB** |
+| `--decoder triton-cuda` | Triton / Triton / CUDA (`csrc/dac_kernels.cu`, mma.sync, Hopper smem) | 203 ms | 0.029 / 0.088 dB |
+| `--encoder trt --decoder cuda` | TensorRT fp16 / TensorRT / CUDA | 238 ms | 0.11 / 0.42 dB |
+| `--encoder trt --decoder trt` | TensorRT fp16 / TensorRT (whole decoder) | 404 ms | 0.08-0.13 dB (5 mixtures) |
+
+The TensorRT encoder is 52 dB from the fp32 reference (Triton: 67 dB) and
+was the main deviation from the official output. TensorRT engines are
+architecture- and version-specific; see `docs/SETUP.md`.
 
 ## Repository layout
 
 | path | |
 |---|---|
-| `src/sidon_trt/frontend.py` | demo preprocessing (CPU + GPU) and fbank, incl. bucket masking |
-| `src/sidon_trt/modeling.py` | encoder / DAC decoder rebuilt as torch modules |
-| `src/sidon_trt/export_onnx.py` | encoder, decoder head and TRT-only decoder ONNX export |
-| `src/sidon_trt/runtime.py` | `TRTPipeline`: bucketed CUDA graphs, demo chunking, sliding windows |
-| `src/sidon_trt/cuda_tail.py`, `csrc/dac_kernels.cu` | fused CUDA decoder tail |
-| `src/sidon_trt/cuda_ext.py` | nvcc build + load of the kernels (no ninja) |
-| `src/sidon_trt/stream.py`, `fileio.py`, `audio_io.py` | overlapped decode / restore / encode |
-| `src/sidon_trt/flexrel_triton.py`, `snake_triton.py` | TensorRT plugins (attention, Snake) |
-| `src/sidon_trt/engines.py` | engine build / TRT stage helpers |
-| `src/sidon_trt/demo.py` | the official demo pipeline (baseline + parity reference) |
+| `src/sidon_triton/frontend.py` | demo preprocessing (CPU + GPU) and fbank, incl. bucket masking |
+| `src/sidon_triton/modeling.py` | encoder / DAC decoder rebuilt as torch modules |
+| `src/sidon_triton/export_onnx.py` | ONNX export for the TensorRT back-ends |
+| `src/sidon_triton/runtime.py` | `SidonPipeline`: bucketed CUDA graphs, demo chunking, sliding windows |
+| `src/sidon_triton/triton_encoder.py` | w2v-BERT encoder (Triton + cuBLAS) |
+| `src/sidon_triton/triton_head.py`, `triton_tail.py` | DAC decoder head / tail (Triton) |
+| `src/sidon_triton/stream.py`, `fileio.py`, `audio_io.py` | overlapped decode / restore / encode |
+| `src/sidon_triton/cuda_tail.py`, `cuda_ext.py`, `csrc/dac_kernels.cu` | optional CUDA tail (nvcc build, no ninja) |
+| `src/sidon_triton/engines.py`, `flexrel_triton.py`, `snake_triton.py` | optional TensorRT engines and plugins |
+| `src/sidon_triton/demo.py` | the official demo pipeline (baseline + parity reference) |
 | `tools/convert_torchscript.py` | TorchScript -> bundle with parity check |
 | `tools/compare_demo.py`, `make_listening_*.py`, `make_window_compare.py` | parity and listening sets |
 | `tools/stress_test.py`, `test_cuda_tail.py` | large-scale and kernel tests |
-| `scripts/` | `build_engines.py`, `run.py`, `bench_e2e.py`, `bench_baseline.py` |
+| `scripts/` | `build_engines.py` (weights / engines), `run.py`, `bench_e2e.py`, `bench_baseline.py` |
 | `scripts/workflows/`, `scripts/examples/` | shell workflows (build, benchmarks, tests, listening) and a batch-job template |
-| `src/sidon_trt/hub.py` | download of the released TorchScript files (pinned revision) |
+| `src/sidon_triton/hub.py` | download of the released TorchScript files (pinned revision) |
 
 ## Acknowledgements
 
-Sidon-TRT is an inference port of **Sidon** by sarulab-speech
+Sidon-Triton is an inference port of **Sidon** by sarulab-speech
 (Wataru Nakata, Yuki Saito, Yota Ueda, Hiroshi Saruwatari); all model weights and the method are
 theirs, and this repository only converts and accelerates the released
 v0.1 model without retraining. If you use it, please cite the Sidon paper:
@@ -245,8 +224,7 @@ v0.1 model without retraining. If you use it, please cite the Sidon paper:
 Sidon builds on [w2v-BERT 2.0](https://huggingface.co/facebook/w2v-bert-2.0)
 (Meta) and the [DAC](https://github.com/descriptinc/descript-audio-codec)
 decoder architecture (Descript).
-<!-- The fused relative-position attention
-TensorRT plugin is shared with FastDialogueSidon. -->
+<!-- The encoder kernels are shared with FastDialogueSidon. -->
 
 ## License
 

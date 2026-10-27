@@ -1,6 +1,6 @@
 // Fused CUDA kernels for the DAC decoder tail of Sidon v0.1 (blocks 2-4:
 // 8 -> 48 kHz). Activations are TIME-MAJOR [B, T, C] (channels contiguous),
-// fp16 (or bf16 with -DSTRT_BF16); accumulation and Snake math in fp32.
+// fp16 (or bf16 with -DSTRITON_BF16); accumulation and Snake math in fp32.
 // Every kernel takes lens [B]: per-item valid rows of a bucket-padded batch
 // (rows past it are read as zeros and written as zeros), so a padded run
 // equals an exact-length run on the valid region.
@@ -22,8 +22,8 @@
 // Shared memory: up to ~210 KB per CTA (C = 96 resunit, 192->96 upsample)
 // -> Hopper / datacenter Blackwell class GPUs (A100 / Ada do not fit).
 //
-// Registered as torch ops sidon_trt::{resunit_mma, upsample, final_head}
-// (sidon_trt_bf16::* for the bf16 build).
+// Registered as torch ops sidon_triton::{resunit_mma, upsample, final_head}
+// (sidon_triton_bf16::* for the bf16 build).
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -33,10 +33,10 @@
 
 #include <cuda_bf16.h>
 
-// Element type: fp16 by default; -DSTRT_BF16 builds the bf16 twin
-// (registered as torch ops sidon_trt_bf16::*). Accumulation and Snake math
+// Element type: fp16 by default; -DSTRITON_BF16 builds the bf16 twin
+// (registered as torch ops sidon_triton_bf16::*). Accumulation and Snake math
 // are fp32 in both.
-#ifdef STRT_BF16
+#ifdef STRITON_BF16
 using elem = __nv_bfloat16;
 using elem2 = __nv_bfloat162;
 #define TO_F2 __bfloat1622float2
@@ -45,7 +45,7 @@ using elem2 = __nv_bfloat162;
 #define FROM_F __float2bfloat16
 #define ELEM_AT at::BFloat16
 #define ELEM_KIND at::kBFloat16
-#define STRT_MMA_T "bf16"
+#define STRITON_MMA_T "bf16"
 #else
 using elem = __half;
 using elem2 = __half2;
@@ -55,7 +55,7 @@ using elem2 = __half2;
 #define FROM_F __float2half
 #define ELEM_AT at::Half
 #define ELEM_KIND at::kHalf
-#define STRT_MMA_T "f16"
+#define STRITON_MMA_T "f16"
 #endif
 
 namespace {
@@ -195,7 +195,8 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
 __device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4],
                                          uint32_t b0, uint32_t b1) {
   asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32." STRT_MMA_T "." STRT_MMA_T ".f32 "
+      "mma.sync.aligned.m16n8k16.row.col.f32." STRITON_MMA_T
+      "." STRITON_MMA_T ".f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -958,28 +959,28 @@ at::Tensor resunit_mma(const at::Tensor& x, const at::Tensor& w1,
   const c10::cuda::CUDAGuard guard(x.device());
   auto y = at::empty_like(x);
   const int64_t C = x.size(2);
-#define STRT_CASE(LAUNCH, CC, DD)                                          \
+#define STRITON_CASE(LAUNCH, CC, DD)                                          \
   if (C == CC && dilation == DD) {                                        \
     LAUNCH<CC, DD>(x, w1, w2, b1, a1, i1, a2, i2, b2, lens, y);           \
     return y;                                                             \
   }
-  STRT_CASE(launch_resunit_mma, 48, 1)
-  STRT_CASE(launch_resunit_mma, 48, 3)
-  STRT_CASE(launch_resunit_mma, 48, 9)
-  STRT_CASE(launch_resunit_mma, 96, 1)
-  STRT_CASE(launch_resunit_mma, 96, 3)
-  STRT_CASE(launch_resunit_mma, 96, 9)
-  STRT_CASE(launch_resunit_stream2, 192, 1)
-  STRT_CASE(launch_resunit_stream2, 192, 3)
-  STRT_CASE(launch_resunit_stream2, 192, 9)
-#undef STRT_CASE
+  STRITON_CASE(launch_resunit_mma, 48, 1)
+  STRITON_CASE(launch_resunit_mma, 48, 3)
+  STRITON_CASE(launch_resunit_mma, 48, 9)
+  STRITON_CASE(launch_resunit_mma, 96, 1)
+  STRITON_CASE(launch_resunit_mma, 96, 3)
+  STRITON_CASE(launch_resunit_mma, 96, 9)
+  STRITON_CASE(launch_resunit_stream2, 192, 1)
+  STRITON_CASE(launch_resunit_stream2, 192, 3)
+  STRITON_CASE(launch_resunit_stream2, 192, 9)
+#undef STRITON_CASE
   TORCH_CHECK(false, "resunit_mma: unsupported C=", C, " dilation=", dilation);
   return y;
 }
 
 }  // namespace
 
-#define STRT_DEFS(m) \
+#define STRITON_DEFS(m) \
   m.def( \
       "resunit_mma(Tensor x, Tensor w1, Tensor w2, Tensor b1, Tensor a1, " \
       "Tensor i1, Tensor a2, Tensor i2, Tensor b2, int dilation, " \
@@ -991,15 +992,15 @@ at::Tensor resunit_mma(const at::Tensor& x, const at::Tensor& w1,
       "final_head(Tensor x, Tensor w, Tensor alpha, Tensor inv, float bias, " \
       "Tensor lens) -> Tensor");
 
-#define STRT_IMPLS(m) \
+#define STRITON_IMPLS(m) \
   m.impl("resunit_mma", &resunit_mma); \
   m.impl("upsample", &upsample); \
   m.impl("final_head", &final_head);
 
-#ifdef STRT_BF16
-TORCH_LIBRARY(sidon_trt_bf16, m) { STRT_DEFS(m) }
-TORCH_LIBRARY_IMPL(sidon_trt_bf16, CUDA, m) { STRT_IMPLS(m) }
+#ifdef STRITON_BF16
+TORCH_LIBRARY(sidon_triton_bf16, m) { STRITON_DEFS(m) }
+TORCH_LIBRARY_IMPL(sidon_triton_bf16, CUDA, m) { STRITON_IMPLS(m) }
 #else
-TORCH_LIBRARY(sidon_trt, m) { STRT_DEFS(m) }
-TORCH_LIBRARY_IMPL(sidon_trt, CUDA, m) { STRT_IMPLS(m) }
+TORCH_LIBRARY(sidon_triton, m) { STRITON_DEFS(m) }
+TORCH_LIBRARY_IMPL(sidon_triton, CUDA, m) { STRITON_IMPLS(m) }
 #endif

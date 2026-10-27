@@ -3,7 +3,9 @@
 
 Per window length: CPU fbank (transformers), TorchScript encoder and
 decoder on GPU (CUDA-event timed). Plus the demo's full ``restore`` on a
-long input (tiled from --wav) with its wall-clock breakdown.
+long input (tiled from --wav) with its wall-clock breakdown, the same
+random short clips as ``bench_e2e.py --clips`` and the device memory used
+after loading.
 
 Run WITHOUT NVIDIA_TF32_OVERRIDE to measure the official path as users run
 it (PyTorch defaults: fp32 matmul, TF32 cuDNN convolutions).
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -21,11 +24,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt import frontend  # noqa: E402
-from sidon_trt.audio_io import read_wav  # noqa: E402
-from sidon_trt.demo import DemoSidon  # noqa: E402
-from sidon_trt.engines import timed_cuda  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton import frontend  # noqa: E402
+from sidon_triton.audio_io import read_wav  # noqa: E402
+from sidon_triton.demo import DemoSidon  # noqa: E402
+from sidon_triton.engines import timed_cuda  # noqa: E402
 
 
 def tiled(wav: Path | None, seconds: float):
@@ -50,12 +53,19 @@ def main() -> None:
         default=[15, 30, 60, 96, 120],
     )
     parser.add_argument("--e2e-seconds", type=float, default=600.0)
+    parser.add_argument("--clips", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
+    def device_used_mb() -> float:
+        free, total = torch.cuda.mem_get_info()
+        return (total - free) / 1e6
+
+    baseline_mb = device_used_mb()
     demo = DemoSidon(args.torchscript_dir, device="cuda")
+    after_init_mb = device_used_mb()
     data, rate = tiled(args.wav, max(args.seconds))
     wav16 = frontend.preprocess(data, rate)
     result = {
@@ -63,6 +73,8 @@ def main() -> None:
         "torch": torch.__version__,
         "tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
         "tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        "baseline_device_memory_mb": baseline_mb,
+        "after_init_device_memory_mb": after_init_mb,
         "lengths": {},
     }
     with torch.inference_mode():
@@ -124,6 +136,31 @@ def main() -> None:
         "wall_ms": wall * 1e3,
         "rtf": wall / (data.shape[-1] / rate),
     }
+    if args.clips:  # same clips as bench_e2e.py (seed 0), demo restore each
+        rng = random.Random(0)
+        source, rate = tiled(args.wav, 64.0)
+        clips = []
+        for _ in range(args.clips):
+            seconds = rng.uniform(1.5, 25.0)
+            start = rng.randint(0, source.shape[-1] - int(seconds * rate) - 1)
+            clips.append(source[0, start : start + int(seconds * rate)].clone())
+        total = sum(c.shape[-1] for c in clips) / rate
+        walls = []
+        for _ in range(3):  # first pass is warm-up
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            for clip in clips:
+                demo.restore(clip, rate)
+            torch.cuda.synchronize()
+            walls.append(time.perf_counter() - started)
+        wall = sorted(walls[1:])[0]
+        result["clips"] = {
+            "count": len(clips),
+            "audio_seconds": total,
+            "wall_ms": wall * 1e3,
+            "rtf": wall / total,
+            "device_memory_mb": device_used_mb(),
+        }
     print(json.dumps(result, indent=2))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

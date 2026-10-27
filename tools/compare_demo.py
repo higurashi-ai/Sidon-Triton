@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end parity: official demo path vs Sidon-TRT ``restore`` on real
+"""End-to-end parity: official demo path vs Sidon-Triton ``restore`` on real
 files. Reports waveform SNR / log-mel distance and writes both outputs
 for listening.
 
@@ -18,11 +18,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt.audio_io import read_wav, write_wav  # noqa: E402
-from sidon_trt.demo import DemoSidon  # noqa: E402
-from sidon_trt.engines import errors  # noqa: E402
-from sidon_trt.runtime import TRTPipeline  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton.audio_io import read_wav, write_wav  # noqa: E402
+from sidon_triton.demo import DemoSidon  # noqa: E402
+from sidon_triton.engines import errors  # noqa: E402
+from sidon_triton.runtime import SidonPipeline  # noqa: E402
 
 
 def log_mel_distance(
@@ -31,7 +31,7 @@ def log_mel_distance(
     """Mean |log-mel| difference (dB) at 48 kHz over ACTIVE frames — those
     within `floor_db` of the reference's loudest frame. Tolerant to phase;
     ignores the fine structure of a -70 dB silence floor, which would
-    otherwise dominate on per-channel telephone audio (each channel is
+    otherwise dominate on per-channel dialogue audio (each channel is
     silent while the other speaker talks)."""
     import torchaudio
 
@@ -60,7 +60,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     demo = DemoSidon(args.torchscript_dir, device="cuda")
-    pipeline = TRTPipeline(args.engine_dir, use_graph=True)
+    pipeline = SidonPipeline(args.engine_dir, use_graph=True)
     report = {}
     for path in args.wavs:
         data, rate = read_wav(path)
@@ -81,7 +81,7 @@ def main() -> None:
             args.output_dir / f"{stem}_demo.wav", reference.cpu().numpy(), 48_000
         )
         write_wav(
-            args.output_dir / f"{stem}_sidon_trt.wav",
+            args.output_dir / f"{stem}_sidon_triton.wav",
             actual.cpu().numpy(),
             48_000,
         )

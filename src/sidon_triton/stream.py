@@ -1,8 +1,8 @@
 """Overlapped file processing: decode / GPU restore / encode in parallel.
 
-    from sidon_trt.runtime import TRTPipeline
-    from sidon_trt.stream import FileStreamer
-    with FileStreamer(TRTPipeline(engine_dir)) as streamer:
+    from sidon_triton.runtime import SidonPipeline
+    from sidon_triton.stream import FileStreamer
+    with FileStreamer(SidonPipeline(engine_dir)) as streamer:
         stats = streamer.run(paths, out_dir)
 
 - decoding runs in a spawned worker-process pool (WAV via the numpy reader,
@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 
 from . import fileio
-from .runtime import OUT_RATE, TRTPipeline
+from .runtime import OUT_RATE, SidonPipeline
 
 
 def output_path(path: Path, root: Path | None, out_dir: Path,
@@ -40,7 +40,7 @@ def output_path(path: Path, root: Path | None, out_dir: Path,
 
 
 class FileStreamer:
-    def __init__(self, pipeline: TRTPipeline, readers: int = 8,
+    def __init__(self, pipeline: SidonPipeline, readers: int = 8,
                  writers: int = 8) -> None:
         self.pipeline = pipeline
         context = mp.get_context("spawn")  # CUDA is initialized: no fork
@@ -150,7 +150,7 @@ class FileStreamer:
         }
 
 
-def stream_files(pipeline: TRTPipeline, paths: list, out_dir: Path,
+def stream_files(pipeline: SidonPipeline, paths: list, out_dir: Path,
                  readers: int = 8, writers: int = 8, **kwargs) -> dict:
     """One-shot convenience wrapper around :class:`FileStreamer`."""
     with FileStreamer(pipeline, readers, writers) as streamer:

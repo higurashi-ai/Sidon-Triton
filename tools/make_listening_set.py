@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Listening set: official demo vs Sidon-TRT on the same inputs.
+"""Listening set: official demo vs Sidon-Triton on the same inputs.
 
     make_listening_set.py --engine-dir E --torchscript-dir sidon-v0.1 \
         --output-dir listening/ inputs/*.wav
 
 Layout:
-    named/<item>/input.wav, official.wav, sidon_trt.wav
+    named/<item>/input.wav, official.wav, sidon_triton.wav
     blind/<item>_A.wav, <item>_B.wav   (random order, key.json reveals)
-Multi-channel inputs (e.g. 2-channel telephone dialogue) are restored per
+Multi-channel inputs (e.g. 2-channel dialogue) are restored per
 channel and written with the same channel layout.
     metrics.json                        (waveform SNR, log-mel L1 vs official)
 """
@@ -28,11 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compare_demo import log_mel_distance  # noqa: E402
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt.audio_io import read_wav, write_wav  # noqa: E402
-from sidon_trt.demo import DemoSidon  # noqa: E402
-from sidon_trt.engines import errors  # noqa: E402
-from sidon_trt.runtime import OUT_RATE, TRTPipeline  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton.audio_io import read_wav, write_wav  # noqa: E402
+from sidon_triton.demo import DemoSidon  # noqa: E402
+from sidon_triton.engines import errors  # noqa: E402
+from sidon_triton.runtime import OUT_RATE, SidonPipeline  # noqa: E402
 
 
 def main() -> None:
@@ -46,7 +46,7 @@ def main() -> None:
     args = parser.parse_args()
 
     demo = DemoSidon(args.torchscript_dir, device="cuda")
-    pipeline = TRTPipeline(args.engine_dir, use_graph=True)
+    pipeline = SidonPipeline(args.engine_dir, use_graph=True)
     rng = random.Random(args.seed)
     (args.output_dir / "blind").mkdir(parents=True, exist_ok=True)
     key, metrics = {}, {}
@@ -73,11 +73,11 @@ def main() -> None:
         shutil.copyfile(path, named / "input.wav")
         outputs = {
             "official": official.cpu().numpy(),
-            "sidon_trt": fast.cpu().numpy(),
+            "sidon_triton": fast.cpu().numpy(),
         }
         for name, audio in outputs.items():
             write_wav(named / f"{name}.wav", audio, OUT_RATE)
-        order = ["official", "sidon_trt"]
+        order = ["official", "sidon_triton"]
         rng.shuffle(order)
         key[item] = {"A": order[0], "B": order[1]}
         for label, name in zip("AB", order):

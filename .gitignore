@@ -47,7 +47,7 @@ scratch/
 *.m4a
 *.npy
 *.npz
-strt-*
+striton-*
 *.o[0-9]*
 *.e[0-9]*
 *.log

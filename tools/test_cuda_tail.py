@@ -17,9 +17,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sidon_trt import cuda_tail  # noqa: E402
-from sidon_trt.engines import errors, timed_cuda  # noqa: E402
-from sidon_trt.modeling import load_bundle  # noqa: E402
+from sidon_triton import cuda_tail  # noqa: E402
+from sidon_triton.engines import errors, timed_cuda  # noqa: E402
+from sidon_triton.modeling import load_bundle  # noqa: E402
 
 
 def main() -> None:

@@ -1,11 +1,11 @@
 """Build (nvcc, no ninja) and load the fused DAC CUDA kernels.
 
-    from sidon_trt import cuda_ext
-    cuda_ext.load()            # registers torch.ops.sidon_trt.*
+    from sidon_triton import cuda_ext
+    cuda_ext.load()            # registers torch.ops.sidon_triton.*
 
 The shared library is cached next to the sources under ``build/`` keyed by
 a hash of the source and flags, so a changed .cu triggers a rebuild.
-Targets: ``STRT_CUDA_ARCHS`` (e.g. "90" or "90;120"), else the visible
+Targets: ``STRITON_CUDA_ARCHS`` (e.g. "90" or "90;120"), else the visible
 GPU's arch, else a portable list.
 """
 
@@ -39,7 +39,7 @@ def _nvcc() -> str:
 def _flags(bf16: bool = False) -> list[str]:
     from torch.utils.cpp_extension import include_paths, library_paths
 
-    archs = os.environ.get("STRT_CUDA_ARCHS", "")
+    archs = os.environ.get("STRITON_CUDA_ARCHS", "")
     if not archs and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         archs = f"{major}{minor}"
@@ -57,7 +57,7 @@ def _flags(bf16: bool = False) -> list[str]:
         *gencode,
     ]
     if bf16:
-        flags.append("-DSTRT_BF16")
+        flags.append("-DSTRITON_BF16")
     flags += [f"-I{path}" for path in include_paths(device_type="cuda")]
     flags += [f"-L{path}" for path in library_paths(device_type="cuda")]
     flags += ["-lc10", "-lc10_cuda", "-ltorch", "-ltorch_cpu", "-ltorch_cuda"]
@@ -73,11 +73,11 @@ def library_path(bf16: bool = False) -> Path:
         + torch.__version__.encode()
     ).hexdigest()[:16]
     suffix = "_bf16" if bf16 else ""
-    return BUILD / f"sidon_trt_dac{suffix}_{digest}.so"
+    return BUILD / f"sidon_triton_dac{suffix}_{digest}.so"
 
 
 def build(verbose: bool = True, bf16: bool = False) -> Path:
-    """bf16=True builds the -DSTRT_BF16 twin (ops sidon_trt_bf16::*)."""
+    """bf16=True builds the -DSTRITON_BF16 twin (ops sidon_triton_bf16::*)."""
     target = library_path(bf16)
     if target.exists():
         return target
@@ -102,4 +102,4 @@ def ops(dtype: torch.dtype = torch.float16):
     """torch.ops namespace of the kernels for `dtype` (fp16 / bf16)."""
     bf16 = dtype == torch.bfloat16
     load(bf16)
-    return torch.ops.sidon_trt_bf16 if bf16 else torch.ops.sidon_trt
+    return torch.ops.sidon_triton_bf16 if bf16 else torch.ops.sidon_triton

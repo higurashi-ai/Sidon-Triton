@@ -1,7 +1,7 @@
 """The official Sidon v0.1 inference path, verbatim from
 huggingface.co/spaces/sarulab-speech/sidon_demo_beta/app.py (TorchScript
 fp32 models + transformers' CPU SeamlessM4TFeatureExtractor). Used as the
-speed baseline and as the parity reference for ``TRTPipeline.restore``.
+speed baseline and as the parity reference for ``SidonPipeline.restore``.
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark the TensorRT pipeline.
+"""Benchmark the pipeline.
 
 - per window length: stage times (fbank front-end, encoder, decoder head,
-  CUDA tail) and the bucketed CUDA-graph chunk;
+  decoder tail) and the bucketed CUDA-graph chunk;
 - the demo-parity ``restore`` on a long input;
 - many short clips of random length: throughput with bucketed graphs.
 """
@@ -20,10 +20,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sidon_trt import cuda_tail, frontend  # noqa: E402
-from sidon_trt.audio_io import read_wav  # noqa: E402
-from sidon_trt.engines import timed_cuda  # noqa: E402
-from sidon_trt.runtime import TRTPipeline  # noqa: E402
+from sidon_triton import frontend  # noqa: E402
+from sidon_triton.audio_io import read_wav  # noqa: E402
+from sidon_triton.engines import timed_cuda  # noqa: E402
+from sidon_triton.runtime import SidonPipeline  # noqa: E402
 
 
 def tiled(wav: Path | None, seconds: float):
@@ -70,7 +70,7 @@ def main() -> None:
         return (total - free) / 1e6
 
     baseline_mb = device_used_mb()
-    pipeline = TRTPipeline(args.engine_dir, use_graph=True)
+    pipeline = SidonPipeline(args.engine_dir, use_graph=True)
     engines = pipeline.long
     data, rate = tiled(args.wav, max(args.seconds) + 2)
     wav16 = frontend.preprocess(data, rate).cuda()
@@ -95,21 +95,20 @@ def main() -> None:
                 lambda: engines.front(wave, valid), args.warmup, args.runs
             )
             entry["stage_encoder"] = timed_cuda(
-                lambda: engines.encoder_stage.enqueue(current()),
+                lambda: engines.run_encoder(1, seq, current()),
                 args.warmup, args.runs,
             )
-            entry["stage_decoder_trt"] = timed_cuda(
-                lambda: engines.decoder_stage.enqueue(current()),
+            dec_input = engines.dec_input[: seq * 1024].view(1, seq, 1024)
+            frames = engines.dec_lens[:1]
+            entry["stage_decoder_head"] = timed_cuda(
+                lambda: engines.run_head(dec_input, frames, current()),
                 args.warmup, args.runs,
             )
             if not engines.trt_decoder:
-                length = cuda_tail.head_samples(seq)
-                z = engines.z[: length * cuda_tail.TAIL_CHANNELS].view(
-                    1, length, cuda_tail.TAIL_CHANNELS
-                )
-                frames = engines.dec_lens[:1]
+                z = engines.run_head(dec_input, frames, current())
                 entry["stage_decoder_tail"] = timed_cuda(
-                    lambda: engines.tail(z, frames), args.warmup, args.runs
+                    lambda: engines.run_tail(z, frames),
+                    args.warmup, args.runs,
                 )
 
             def chunk():

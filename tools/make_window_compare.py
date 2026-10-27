@@ -4,8 +4,8 @@
 For each input writes <output>/<item>/:
     0_input.wav
     1_official_96s.wav          official demo (96 s chunks)
-    2_sidon_trt_96s.wav         Sidon-TRT, demo chunking (96 s, 1-frame carry)
-    3_sidon_trt_slide20.wav     Sidon-TRT, 20 s windows / 1 s overlap
+    2_sidon_triton_96s.wav         Sidon-Triton, demo chunking (96 s, 1-frame carry)
+    3_sidon_triton_slide20.wav     Sidon-Triton, 20 s windows / 1 s overlap
     96s_then_slide20.wav        2 then 0.7 s silence then 3
 Multi-channel inputs are restored per channel. metrics.json holds log-mel
 L1 (active frames) of 2 and 3 vs the official and of 3 vs 2, plus a speed
@@ -29,10 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compare_demo import log_mel_distance  # noqa: E402
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt.audio_io import read_wav, write_wav  # noqa: E402
-from sidon_trt.demo import DemoSidon  # noqa: E402
-from sidon_trt.runtime import OUT_RATE, TRTPipeline  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton.audio_io import read_wav, write_wav  # noqa: E402
+from sidon_triton.demo import DemoSidon  # noqa: E402
+from sidon_triton.runtime import OUT_RATE, SidonPipeline  # noqa: E402
 
 
 def timed(fn, runs: int = 5) -> float:
@@ -61,7 +61,7 @@ def main() -> None:
     args = parser.parse_args()
 
     demo = DemoSidon(args.torchscript_dir, device="cuda")
-    pipeline = TRTPipeline(args.engine_dir, use_graph=True)
+    pipeline = SidonPipeline(args.engine_dir, use_graph=True)
     slide = dict(
         window_seconds=args.window_seconds,
         overlap_seconds=args.overlap_seconds,
@@ -93,8 +93,8 @@ def main() -> None:
         shutil.copyfile(path, folder / "0_input.wav")
         outputs = {
             "1_official_96s": official,
-            "2_sidon_trt_96s": one_shot,
-            "3_sidon_trt_slide20": sliding,
+            "2_sidon_triton_96s": one_shot,
+            "3_sidon_triton_slide20": sliding,
         }
         for name, audio in outputs.items():
             write_wav(folder / f"{name}.wav", audio.cpu().numpy(), OUT_RATE)

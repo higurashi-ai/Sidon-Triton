@@ -25,9 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compare_demo import log_mel_distance  # noqa: E402
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt.demo import DemoSidon  # noqa: E402
-from sidon_trt.runtime import OUT_RATE, TRTPipeline  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton.demo import DemoSidon  # noqa: E402
+from sidon_triton.runtime import OUT_RATE, SidonPipeline  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -93,7 +93,7 @@ def main() -> None:
     total_seconds = sum(w.numel() / r for _, w, r in clips)
     print(f"{len(clips)} clips, {total_seconds / 3600:.2f} h", flush=True)
 
-    pipeline = TRTPipeline(args.engine_dir)
+    pipeline = SidonPipeline(args.engine_dir)
     report = {"clips": len(clips), "audio_hours": total_seconds / 3600}
 
     # -- all clips -------------------------------------------------------------

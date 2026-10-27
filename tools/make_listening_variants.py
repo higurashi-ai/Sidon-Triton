@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Localize audible differences: official Sidon vs Sidon-TRT stage by stage.
+"""Localize audible differences: official Sidon vs Sidon-Triton stage by stage.
 
 For each (single-chunk, <= 94 s) input, writes to <output>/<item>/:
     0_input.wav            the input
@@ -7,10 +7,10 @@ For each (single-chunk, <= 94 s) input, writes to <output>/<item>/:
     2_A_fp32.wav           our torch fp32 encoder + fp32 decoder (should match 1)
     3_B_enc_trt.wav       TensorRT encoder (bf16 or fp16 engine) + fp32 torch decoder
     4_C_dec_fast.wav       fp32 torch encoder + fast decoder (TRT head + CUDA tail)
-    5_D_sidon_trt.wav      Sidon-TRT (TRT encoder + fast decoder)
-    6_E_sidon_trt_fp32.wav Sidon-TRT all-fp32 engines (--engine-dir-fp32)
-    7_F_sidon_trt_bf16tail.wav  Sidon-TRT with the bf16 CUDA tail (--bf16-tail)
-    official_then_sidon_trt.wav   1 then 0.7 s silence then 5
+    5_D_sidon_triton.wav      Sidon-Triton (TRT encoder + fast decoder)
+    6_E_sidon_triton_fp32.wav Sidon-Triton all-fp32 engines (--engine-dir-fp32)
+    7_F_sidon_triton_bf16tail.wav  Sidon-Triton with the bf16 CUDA tail (--bf16-tail)
+    official_then_sidon_triton.wav   1 then 0.7 s silence then 5
 Multi-channel inputs are processed channel by channel (2-channel dialogue:
 one speaker per channel) and keep their channel layout.
 and metrics.json with log-mel L1 / SNR of every variant vs the official.
@@ -32,25 +32,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from compare_demo import log_mel_distance  # noqa: E402
 
-from sidon_trt import hub  # noqa: E402
-from sidon_trt import frontend  # noqa: E402
-from sidon_trt.audio_io import read_wav, write_wav  # noqa: E402
-from sidon_trt.demo import DemoSidon  # noqa: E402
-from sidon_trt.engines import errors  # noqa: E402
-from sidon_trt.modeling import load_bundle  # noqa: E402
-from sidon_trt.runtime import (  # noqa: E402
+from sidon_triton import hub  # noqa: E402
+from sidon_triton import frontend  # noqa: E402
+from sidon_triton.audio_io import read_wav, write_wav  # noqa: E402
+from sidon_triton.demo import DemoSidon  # noqa: E402
+from sidon_triton.engines import errors  # noqa: E402
+from sidon_triton.modeling import load_bundle  # noqa: E402
+from sidon_triton.runtime import (  # noqa: E402
     DEMO_CHUNK_SECONDS,
     DEMO_TAIL_PAD,
     HOP,
     OUT_RATE,
     TRIM,
-    TRTPipeline,
+    SidonPipeline,
 )
 
 
 @torch.no_grad()
 def fast_decoder(
-    pipeline: TRTPipeline, hidden: torch.Tensor, tail=None
+    pipeline: SidonPipeline, hidden: torch.Tensor, tail=None
 ) -> torch.Tensor:
     """TRT head + CUDA tail on hidden [1, L, 1024] -> audio [N] (GPU).
     `tail` overrides the pipeline's tail (e.g. the bf16 kernel build)."""
@@ -68,7 +68,7 @@ def fast_decoder(
 
 
 @torch.no_grad()
-def trt_encoder(pipeline: TRTPipeline, features: torch.Tensor) -> torch.Tensor:
+def trt_encoder(pipeline: SidonPipeline, features: torch.Tensor) -> torch.Tensor:
     hidden = pipeline.long.encode(features)
     torch.cuda.synchronize()
     return hidden
@@ -83,27 +83,27 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--bf16-tail", action="store_true",
-        help="add 7_F_sidon_trt_bf16tail (CUDA tail kernels built in bf16)",
+        help="add 7_F_sidon_triton_bf16tail (CUDA tail kernels built in bf16)",
     )
     parser.add_argument(
         "--engine-dir-fp32", type=Path, default=None,
-        help="optional all-fp32 Sidon-TRT engines -> 6_E_sidon_trt_fp32",
+        help="optional all-fp32 Sidon-Triton engines -> 6_E_sidon_triton_fp32",
     )
     parser.add_argument("wavs", type=Path, nargs="+")
     args = parser.parse_args()
     torch.set_float32_matmul_precision("highest")
 
     demo = DemoSidon(args.torchscript_dir, device="cuda")
-    pipeline = TRTPipeline(args.engine_dir, use_graph=False)
+    pipeline = SidonPipeline(args.engine_dir, use_graph=False)
     pipeline32 = (
-        TRTPipeline(args.engine_dir_fp32, use_graph=False)
+        SidonPipeline(args.engine_dir_fp32, use_graph=False)
         if args.engine_dir_fp32 else None
     )
     bundle = load_bundle(args.bundle, device="cuda")
     front = frontend.SeamlessFbank().cuda().eval()
     tail_bf16 = None
     if args.bf16_tail:
-        from sidon_trt.cuda_tail import CudaDecoderTail
+        from sidon_triton.cuda_tail import CudaDecoderTail
 
         tail_bf16 = CudaDecoderTail(
             bundle.decoder, dtype=torch.bfloat16
@@ -130,11 +130,11 @@ def main() -> None:
 
             extra = {}
             if tail_bf16 is not None:
-                extra["7_F_sidon_trt_bf16tail"] = finish(
+                extra["7_F_sidon_triton_bf16tail"] = finish(
                     fast_decoder(pipeline, hidden_trt, tail=tail_bf16)
                 )
             if pipeline32 is not None:
-                extra["6_E_sidon_trt_fp32"] = finish(
+                extra["6_E_sidon_triton_fp32"] = finish(
                     fast_decoder(pipeline32, trt_encoder(pipeline32, features))
                 )
             return {
@@ -143,7 +143,7 @@ def main() -> None:
                 "2_A_fp32": dec32(hidden32),
                 "3_B_enc_trt": dec32(hidden_trt),
                 "4_C_dec_fast": finish(fast_decoder(pipeline, hidden32)),
-                "5_D_sidon_trt": finish(fast_decoder(pipeline, hidden_trt)),
+                "5_D_sidon_triton": finish(fast_decoder(pipeline, hidden_trt)),
             }
 
     for path in args.wavs:
@@ -172,10 +172,10 @@ def main() -> None:
             (official.shape[0], int(0.7 * OUT_RATE)), dtype=np.float32
         )
         write_wav(
-            folder / "official_then_sidon_trt.wav",
+            folder / "official_then_sidon_triton.wav",
             np.concatenate(
                 [official.cpu().numpy(), silence,
-                 outputs["5_D_sidon_trt"].cpu().numpy()],
+                 outputs["5_D_sidon_triton"].cpu().numpy()],
                 axis=1,
             ),
             OUT_RATE,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore speech files with Sidon-TRT (48 kHz output).
+"""Restore speech files with Sidon-Triton (48 kHz output).
 
     run.py --engine-dir E --output-dir out/ a.wav b.flac ...
     run.py --engine-dir E --output-dir out/ --input-dir corpus/ [--glob '**/*.flac']
@@ -7,9 +7,9 @@
 
 Any length, sample rate and channel count; processing follows the
 official demo (96 s chunks, 1-frame feature carry-over). --per-channel
-restores each channel on its own (2-channel telephone dialogue).
+restores each channel on its own (2-channel dialogue).
 Decoding and encoding run in worker processes overlapped with the GPU
-(sidon_trt.stream); --input-dir mirrors its tree under --output-dir.
+(sidon_triton.stream); --input-dir mirrors its tree under --output-dir.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sidon_trt.runtime import TRTPipeline  # noqa: E402
-from sidon_trt.stream import FileStreamer  # noqa: E402
+from sidon_triton.runtime import SidonPipeline  # noqa: E402
+from sidon_triton.stream import FileStreamer  # noqa: E402
 
 
 def main() -> None:
@@ -63,7 +63,7 @@ def main() -> None:
     if not paths:
         parser.error("no input files")
 
-    pipeline = TRTPipeline(args.engine_dir)
+    pipeline = SidonPipeline(args.engine_dir)
     with FileStreamer(pipeline, args.readers, args.writers) as streamer:
         stats = streamer.run(
             paths, args.output_dir, root=args.input_dir, fmt=args.format,

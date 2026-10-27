@@ -55,7 +55,7 @@ def _vec(t: torch.Tensor) -> torch.Tensor:
 
 
 class FusedResUnit(nn.Module):
-    """modeling.ResidualUnit -> packed weights for sidon_trt::resunit_mma
+    """modeling.ResidualUnit -> packed weights for sidon_triton::resunit_mma
     (C = 48 / 96 / 192)."""
 
     def __init__(self, unit: nn.Module,
@@ -91,7 +91,7 @@ class FusedResUnit(nn.Module):
 
 
 class FusedUpsample(nn.Module):
-    """DecoderBlock's Snake + ConvTranspose1d -> sidon_trt::upsample."""
+    """DecoderBlock's Snake + ConvTranspose1d -> sidon_triton::upsample."""
 
     def __init__(self, block: nn.Module,
                  dtype: torch.dtype = torch.float16) -> None:

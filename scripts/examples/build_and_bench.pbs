@@ -1,7 +1,7 @@
 #!/bin/bash
 # Example batch job (PBS Pro) wrapping a workflow script. Adjust the
 # resource request, account/group and module lines for your cluster.
-#PBS -N sidon-trt-build
+#PBS -N sidon-triton-build
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=02:00:00
 #PBS -j oe
@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "${PBS_O_WORKDIR}"
 # module load cuda/12.9          # nvcc for the CUDA tail kernels
-export STRT_WORK="${PBS_LOCALDIR:-${TMPDIR:-/tmp}}/sidon-trt"
+export STRITON_WORK="${PBS_LOCALDIR:-${TMPDIR:-/tmp}}/sidon_triton"
 # EVAL_WAVS: space-separated inputs for the parity check (qsub -v EVAL_WAVS=...)
 # shellcheck disable=SC2086
 scripts/workflows/build_and_bench.sh ${EVAL_WAVS:-}

@@ -1,4 +1,4 @@
-# Sidon-TRT runtime environment — source this before any script.
+# Sidon-Triton runtime environment — source this before any script.
 # Copy to env.local.sh and adjust paths for your site.
 
 # REQUIRED: TF32 must be off. The fbank front-end GEMM must be true fp32
@@ -7,15 +7,18 @@
 export NVIDIA_TF32_OVERRIDE=0
 
 # Python with this package installed (see docs/SETUP.md); default: python3 on PATH
-export STRT_PYTHON="${STRT_PYTHON:-$(command -v python3)}"
+export STRITON_PYTHON="${STRITON_PYTHON:-$(command -v python3)}"
 
-# tensorrt-cu12 pip wheels put libnvinfer under site-packages/tensorrt_libs
-TRT_LIBS="$("${STRT_PYTHON}" - <<'PY'
+# Optional TensorRT back-end ([trt] extra): tensorrt-cu12 pip wheels put
+# libnvinfer under site-packages/tensorrt_libs. Skipped when not installed.
+TRT_LIBS="$("${STRITON_PYTHON}" - 2>/dev/null <<'PY' || true
 import pathlib, tensorrt_libs
 print(pathlib.Path(tensorrt_libs.__file__).parent)
 PY
 )"
-export LD_LIBRARY_PATH="${TRT_LIBS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+if [ -n "${TRT_LIBS}" ]; then
+  export LD_LIBRARY_PATH="${TRT_LIBS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 
 # Triton kernel cache off shared filesystems (NFS quota / lock contention)
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/$USER/triton-cache}"
